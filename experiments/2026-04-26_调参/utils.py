@@ -266,47 +266,23 @@ def sigmoid_focal_loss(
 ) -> torch.Tensor:
     """Focal Loss: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
 
-    设计目的: 解决类别不平衡问题。通过降低"易分样本"的损失权重，
-    使模型在训练时更关注"难分样本"和少数类样本。
-
     Args:
-        logits: (N,) 原始 logits（未经过 sigmoid）。
-        targets: (N,) 二元标签 {0, 1}。
-        alpha: 正样本权重，范围 (0, 1)。当正样本占主导时，使用 alpha < 0.5
-            来降低正类的权重；反之若负样本极多，可适当提高 alpha。
-        gamma: 聚焦参数。gamma=0 退化为标准 BCE 损失；gamma=2 是论文推荐值，
-            对易分样本的惩罚衰减最强。
-        reduction: 损失聚合方式: 'mean' 求平均 | 'sum' 求和 | 'none' 返回逐元素损失。
+        logits: (N,) raw logits (before sigmoid).
+        targets: (N,) binary labels {0, 1}.
+        alpha: positive-class weight in (0, 1). When positives dominate,
+            use alpha < 0.5 to downweight the positive class.
+        gamma: focusing parameter. gamma=0 degenerates to standard BCE;
+            gamma=2 is the standard value.
+        reduction: 'mean' | 'sum' | 'none'.
     """
-    # Step 1: 将 logits 转换为概率 p ∈ (0, 1)
     p = torch.sigmoid(logits)
-
-    # Step 2: 计算标准二元交叉熵损失 (BCE)
-    # reduction='none' 保留逐元素损失，方便后续与 focal_weight 逐元素相乘
     bce_loss = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-
-    # Step 3: 构造 p_t —— 模型对"正确类别"的预测概率
-    # 当 target=1 时，p_t = p（模型预测正类的概率）
-    # 当 target=0 时，p_t = 1-p（模型预测负类的概率）
     p_t = p * targets + (1 - p) * (1 - targets)
-
-    # Step 4: 计算 Focal Weight —— Focal Loss 的核心
-    # (1 - p_t)^gamma: 对于易分样本（p_t 接近 1），权重趋近于 0，降低其损失贡献；
-    # 对于难分样本（p_t 接近 0），权重趋近于 1，保留其损失信号。
     focal_weight = (1 - p_t) ** gamma
-
-    # Step 5: 计算类别平衡权重 alpha_t
-    # 正样本(target=1)乘以 alpha，负样本(target=0)乘以 (1-alpha)
-    # 用于显式调节正负样本对总损失的贡献比例
     alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-
-    # Step 6: 组合三项得到最终的 Focal Loss
-    # loss = 类别权重 * 难易样本权重 * 基础BCE损失
     loss = alpha_t * focal_weight * bce_loss
-
-    # Step 7: 按指定方式聚合损失
     if reduction == 'mean':
-        return loss.mean()   # 返回批次平均损失，最常用的聚合方式
+        return loss.mean()
     elif reduction == 'sum':
-        return loss.sum()    # 返回批次总损失，适用于梯度累积等场景
-    return loss              # reduction='none'，返回 (N,) 的逐元素损失张量
+        return loss.sum()
+    return loss
