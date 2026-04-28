@@ -59,6 +59,77 @@ def build_feature_specs(
 
 
 def parse_args() -> argparse.Namespace:
+    """Parse and return training command-line arguments.
+
+    本函数集中定义了 PCVRHyFormer 训练流程所需的全部超参数与路径配置，
+    并支持通过环境变量覆盖对应 CLI 参数（优先级：环境变量 > CLI > 默认值）。
+
+    参数按功能分为以下几组：
+
+    1. 路径配置 (Paths)
+       - data_dir      : 训练数据目录，需包含 *.parquet 与 schema.json。默认 None。
+       - schema_path   : 特征模式 JSON 的显式路径；默认从 <data_dir>/schema.json 读取。默认 None。
+       - ckpt_dir      : 模型检查点输出目录。默认 None。
+       - log_dir       : 文本日志输出目录。默认 None。
+
+    2. 训练超参数 (Training Hyperparameters)
+       - batch_size    : 每个训练 / 验证步的样本数。默认 256。
+       - lr            : 稠密参数的学习率（AdamW）。默认 1e-4。
+       - num_epochs    : 最大训练轮数，通常由早停机制提前终止。默认 999。
+       - patience      : 早停耐心值：连续 patience 轮验证无提升则停止。默认 5。
+       - seed          : 随机种子，保证实验可复现。默认 42。
+       - device        : 训练设备，自动检测 cuda 可用性，否则回退 cpu。
+
+    3. 数据流水线 (Data Pipeline)
+       - num_workers        : DataLoader 子进程数。默认 16。
+       - buffer_batches     : Shuffle 缓冲区大小（以 batch 为单位），越小内存占用越低。默认 20。
+       - train_ratio        : 训练 Row Group 使用比例（取前 N%）。默认 1.0。
+       - valid_ratio        : 验证 Row Group 比例（取尾部）。默认 0.1。
+       - eval_every_n_steps : 每 N 步执行一次验证；0 表示仅在 epoch 结束时验证。默认 0。
+       - seq_max_lens       : 各序列域截断长度，格式 "seq_a:256,seq_b:128"。默认
+         'seq_a:256,seq_b:256,seq_c:512,seq_d:512'。
+
+    4. 模型结构 (Model Architecture)
+       - d_model             : 模型主隐藏维度（每个块的输出维度）。默认 64。
+       - emb_dim             : Embedding 表逐表维度（投影前）。默认 64。
+       - num_queries         : 每序列域独立生成的 Query Token 数量。默认 1。
+       - num_hyformer_blocks : 堆叠的 MultiSeqHyFormerBlock 层数。默认 2。
+       - num_heads           : 注意力头数，需满足 d_model % num_heads == 0。默认 4。
+       - seq_encoder_type    : 序列编码器变体：swiglu / transformer / longer。默认 'transformer'。
+       - hidden_mult         : FFN 中间层维度相对于 d_model 的倍数。默认 4。
+       - dropout_rate        : 主干 Dropout 率；序列 id-embedding Dropout 为该值的两倍。默认 0.01。
+       - seq_top_k           : LongerEncoder 保留的最新 token 数（仅 longer 有效）。默认 50。
+       - seq_causal          : LongerEncoder 是否使用因果掩码（仅 longer 有效）。默认 False。
+       - action_num          : 分类器输出维度（1 为二分类 logit；>1 为多标签）。默认 1。
+       - use_time_buckets    : 是否启用时间桶嵌入（默认开启）。默认 True。
+       - rank_mixer_mode     : RankMixerBlock 模式：full / ffn_only / none。默认 'full'。
+       - use_rope            : 是否在序列注意力中启用 RoPE 位置编码。默认 False。
+       - rope_base           : RoPE 基底频率。默认 10000.0。
+
+    5. 损失函数 (Loss Function)
+       - loss_type    : 损失类型：bce (BCEWithLogits) 或 focal (Focal Loss)。默认 'bce'。
+       - focal_alpha  : Focal Loss 正类权重 α（仅 focal 有效）。默认 0.1。
+       - focal_gamma  : Focal Loss 聚焦参数 γ（仅 focal 有效）。默认 2.0。
+
+    6. 稀疏优化器 (Sparse Optimizer)
+       - sparse_lr                   : Embedding 等稀疏参数的 Adagrad 学习率。默认 0.05。
+       - sparse_weight_decay         : 稀疏参数的权重衰减。默认 0.0。
+       - reinit_sparse_after_epoch   : 从第 N 轮起，每轮结束重新初始化高基数 Embedding。默认 1。
+       - reinit_cardinality_threshold: 触发重初始化的高基数阈值（0 表示不重置）。默认 0。
+
+    7. Embedding 构造控制
+       - emb_skip_threshold : 词表大小超过该阈值的特征不建 Embedding，前向时置零向量（节省显存）。默认 0。
+       - seq_id_threshold   : 序列 tokenizer 中，词表大小超过该值的特征视为 id 特征，训练时施加额外 Dropout(rate*2)。默认 10000。
+
+    8. NS 特征分组与 Tokenizer
+       - ns_groups_json    : NS 分组 JSON 路径；不存在时退化为每个特征自成一组。默认同目录下 ns_groups.json。
+       - ns_tokenizer_type : NS tokenizer 变体：group（每组一个 token）或 rankmixer（拼接后均分）。默认 'rankmixer'。
+       - user_ns_tokens    : rankmixer 模式下用户 NS token 数（0 表示自动使用用户组数）。默认 0。
+       - item_ns_tokens    : rankmixer 模式下物品 NS token 数（0 表示自动使用物品组数）。默认 0。
+
+    Returns:
+        解析后的 argparse.Namespace 对象，包含所有训练参数。
+    """
     parser = argparse.ArgumentParser(description="PCVRHyFormer Training")
 
     # Paths (environment variables take precedence).
