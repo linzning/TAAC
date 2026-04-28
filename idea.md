@@ -126,6 +126,7 @@ start_pos = valid_len - actual_k  # 总是取尾部
 **问题**：当前所有序列强制使用同一种 `seq_encoder_type`。
 
 **改进**：
+
 - 不同序列采用不同编码器：例如点击序列长用 `longer`，曝光序列短用 `transformer`，收藏序列用 `swiglu`
 - 在 `train.py` 中支持按 domain 指定 encoder 类型
 
@@ -224,36 +225,6 @@ start_pos = valid_len - actual_k  # 总是取尾部
 
 ---
 
-### 4.2 P0：候选物品-序列匹配特征（最强信号）不行
-
-对 4 个 domain 的序列分别计算以下特征。由于特征匿名，假设每个序列的第一个 side-info fid 为 `item_id`（若实际不是，需调整 fid 索引）。
-
-| 特征名 | 计算方式 | 作用 |
-|--------|----------|------|
-| `{domain}_item_match_flag` | 候选 item_id ∈ 序列 item_ids ? 1 : 0 | 用户是否对该物品有过历史行为 |
-| `{domain}_item_match_count` | 候选 item_id 在序列中出现次数 | 重复交互 = 强兴趣信号 |
-| `{domain}_item_match_last_pos` | 候选 item_id 最近一次出现的位置（倒序，1=最近） | 越近相关性越高 |
-| `{domain}_item_match_time_diff` | 当前 timestamp - 候选 item_id 最近一次出现时间 | 时间衰减的精细建模 |
-
-**为什么对 AUC 排序有效**：排序任务的核心是 User-Item 匹配度评估。序列中的直接命中是模型难以通过 Attention 机制完全捕捉的硬信号——即使模型能学到，显式特征也能加速收敛并提升稳定性。
-
-**在线实现位置**：`dataset.py` 的 `_convert_batch` 中，在序列特征处理后、返回 result 前计算。
-
-```python
-# 伪代码示例
-candidate_item_ids = item_int[:, item_id_offset]  # (B,)
-for domain in self.seq_domains:
-    seq_items = result[domain][:, 0, :]  # 假设 slot 0 是 item_id, (B, seq_len)
-    # flag
-    match_flag = (seq_items == candidate_item_ids.unsqueeze(1)).any(dim=1).float()
-    # count
-    match_count = (seq_items == candidate_item_ids.unsqueeze(1)).sum(dim=1).float()
-    # last_pos: 倒序查找第一个匹配位置
-    ...
-```
-
----
-
 ### 4.3 P0：时间感知增强特征
 
 当前仅有 `time_bucket`（粗粒度分桶）。增加以下精细时间特征：
@@ -266,6 +237,7 @@ for domain in self.seq_domains:
 | `{domain}_time_gap_std` | 序列内相邻行为时间差的方差 | 行为规律性波动 |
 
 **补充全局时间特征**：
+
 | 特征名 | 计算方式 |
 |--------|----------|
 | `hour_of_day` | `timestamp % 86400 // 3600` | 一天中的小时（周期性） |
@@ -325,6 +297,7 @@ for domain in self.seq_domains:
 3. 保存 embedding 表，随代码提交到平台
 
 **在线计算特征**：
+
 | 特征名 | 计算方式 |
 |--------|----------|
 | `seq_item_emb_mean` | 序列中所有 item embedding 的均值 |
