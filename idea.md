@@ -10,7 +10,7 @@ HyFormer 的核心设计是**"交替优化"**：每层内先通过 **Query Decod
 
 ## 二、改进方向
 
-### 1. 序列间交互机制（Inter-Sequence Interaction）已实验
+### 1. 序列间交互机制（Inter-Sequence Interaction）已实验-有效
 
 **问题**：当前每个序列独立编码、独立 Cross-Attention，序列之间**没有显式信息交换**。多个序列（点击 / 加购 / 支付等）的 Query tokens 只是简单 concat 后进 RankMixer。
 
@@ -29,7 +29,7 @@ for i in range(S):
 
 ---
 
-### 2. 最终输出显式融合 NS Tokens【高优先级】
+### 2. 最终输出显式融合 NS Tokens【高优先级】已实验-较为有效
 
 **问题**：当前输出只用了 Q tokens：
 
@@ -41,6 +41,7 @@ output = self.output_proj(all_q.view(B, -1))  # (B, D)
 NS tokens 经过每层的 RankMixer 后也蕴含丰富的交互信息，但**完全被丢弃**。
 
 **改进**：
+
 - 类似 BERT 的 `[CLS]` 设计，将 NS tokens 与 Q tokens 一起 flatten 后投影
 - 或增加一个独立的 NS aggregation head，与 Q-based 输出融合
 
@@ -52,16 +53,6 @@ output = self.output_proj(
     torch.cat([all_q.view(B, -1), ns_out], dim=-1)
 )
 ```
-
----
-
-### 3. 候选物品（Candidate Item）的显式 Query 注入【中优先级】
-
-**问题**：论文提到 Global Tokens "derived from original candidate item"。当前代码中 item 特征通过 `item_ns_tokenizer` 进入 NS tokens，但**没有生成候选感知的专用 Query**。
-
-**改进**：
-- 在 `MultiSeqQueryGenerator` 中，将候选 item 特征单独抽取出来，生成 `candidate-aware query tokens`
-- 这些 query 专门用于解码与候选物品最相关的序列信息
 
 ---
 
@@ -96,6 +87,7 @@ token_emb = token_emb + self.time_embedding(time_bucket_ids)
 **问题**：每个 block 内的 `seq_encoder` 是单层的。如果序列很长（如 `seq_d:512`）或语义复杂，单层自注意力的建模能力可能不足。
 
 **改进**：
+
 - 在 `TransformerEncoder` 内部堆叠 2 层（增加 `num_encoder_layers` 参数）
 - 或探索**跨层参数共享**的序列编码器，在增加深度的同时控制参数量
 
@@ -112,6 +104,7 @@ start_pos = valid_len - actual_k  # 总是取尾部
 对于某些序列（如支付序列），最早的几个行为可能同样重要。
 
 **改进**：
+
 - 引入**重要性采样**：基于时间衰减 + 频率的重要性分数选择 top_k
 - 或混合策略：最近 k/2 + 最重要 k/2
 
@@ -150,13 +143,240 @@ start_pos = valid_len - actual_k  # 总是取尾部
 
 ---
 
-## 三、建议的实验优先级
+## 三、特征工程
 
-| 优先级 | 改进方向 | 预期收益 | 实现复杂度 |
-|--------|---------|---------|-----------|
-| P0 | 序列间交互机制 | 显著提升多序列场景效果 | 中 |
-| P0 | 输出融合 NS tokens | 提升信息利用效率 | 低 |
-| P1 | 候选物品显式 Query | 增强候选感知能力 | 中 |
-| P1 | 时间衰减权重 | 提升长序列建模质量 | 低 |
-| P2 | RankMixer 约束松绑 | 更灵活的模型配置 | 中 |
-| P2 | 学习率预热 + 辅助任务 | 训练稳定性与表示质量 | 低 |
+### 1. 基础属性特征（Raw Features）
+
+直接对原始字段进行清理和编码，这是所有特征的基础。
+
+- **类别特征（Categorical）：** 对 ID 类（UserID, ItemID）、属性类（城市、类别）进行 `Label Encoding` 或 `One-hot Encoding`。
+- **数值特征（Numerical）：** 对价格、时长等进行归一化（Normalization）或标准化（Standardization），减少极值影响。
+- **连续变量离散化：** 比如将“年龄”分桶（Binning），可以增强特征的鲁棒性，捕捉非线性关系。
+
+### 2. 统计特征（Statistical Features）
+
+通过历史数据统计，刻画实体的活跃度或受欢迎程度。
+
+- **计数特征（Count）：** 比如用户近 7 天的点击数、某个商品的领取次数。
+- **转化率/CTR（Target Encoding）：** 核心特征。计算某个特征（如 `BrandID`）在历史数据中的点击率。
+  - *注意：* 为防止标签泄露，必须使用 **五折交叉统计** 或 **Leave-one-out** 方法。
+- **分位数与偏离度：** 比如“当前商品价格”相对于“用户历史购买均价”的偏离程度，刻画用户的价格敏感度。
+
+#### 3. 序列特征（Sequence Features）
+
+推荐系统的本质是时序预测，挖掘用户的兴趣演变至关重要。
+
+- **历史行为序列：** 用户最近点击的 5/10/50 个商品 ID。
+- **时间间隔（Time Gap）：** * 距离上次行为的时间（判断用户意图是否还存在）。
+  - 距离该商品上一次被点击的时间（刻画商品的实时热度）。
+- **位置特征：** 物品在瀑布流中的曝光位置（用于消除位置偏见/Positional Bias）。
+
+### 4. 交叉特征（Interaction Features）
+
+手动模拟模型难以捕捉的高阶非线性组合。
+
+- **笛卡尔积：** 比如 `UserID & Category`，刻画用户对特定类别的偏好。
+- **业务逻辑交叉：** “性别 + 肤质”、“机型 + 游戏类型”。
+- **统计交叉：** 计算用户在某个类别下的点击占比。
+
+### 5. 向量化与 Embedding（Representation Learning）
+
+利用特征提取技术将离散 ID 映射到连续空间。
+
+- **协同过滤向量：** 通过矩阵分解（MF）得到的 User/Item Embedding。
+- **图特征（Graph）：** 构建“用户-商品”二部图，利用 **DeepWalk** 或 **Node2vec** 生成 Embedding，捕捉二阶甚至高阶的相似性。
+- **语义特征：** 利用预训练模型（如 BERT, CLIP）提取商品标题、图片的向量，计算 User-Item 的余弦相似度。
+
+### 6. 趋势与动态特征（Dynamic Features）
+
+- **窗口统计：** 计算近 1 小时、1 天、3 天的活跃度变化趋势。
+- **衰减特征：** 给历史行为加上时间衰减因子（Time Decay），近期的行为权重更高。
+
+------
+
+### 💡 比赛中的提分技巧（Trick）
+
+1. **穿越特征检查：** 确保特征提取时只使用了“当前时刻”之前的数据，严禁使用未来信息。
+2. **特征选择：** 使用 `LightGBM` 或 `XGBoost` 跑一个基础模型，观察 **Feature Importance**，剔除重要性极低的噪声特征。
+3. **零值处理：** 对于冷启动（新用户/新物品），需要设计专门的默认值填充逻辑。
+
+---
+
+## 四、竞赛特征工程方案（AUC 排序任务，当前 Baseline 0.811）
+
+**前提约束**：
+- 完整数据 2 亿条在官方平台，本地仅 demo 数据用于流程验证
+- 除 `uid`、`item_id`、`label_type`、`label_time`、`timestamp` 外，所有特征匿名
+- 损失函数为逐样本 BCE，label=1 为正样本，label=0 为负样本
+- 评估指标：AUC
+
+### 4.1 特征工程总览
+
+| 层级 | 特征类别 | 优先级 | 实现方式 | 预期收益 |
+|------|----------|--------|----------|----------|
+| P0 | 候选物品-序列匹配特征 | 高 | 在线计算（dataset.py）| +0.003~0.008 |
+| P0 | 时间感知增强特征 | 高 | 在线计算 | +0.002~0.005 |
+| P1 | 序列内部统计特征 | 高 | 在线计算 | +0.001~0.003 |
+| P1 | 跨序列聚合特征 | 中 | 在线计算 | +0.001~0.003 |
+| P2 | 全局统计特征（CTR/计数）| 中 | 离线预计算 + 五折交叉 | +0.003~0.010 |
+| P2 | Embedding 相似度特征 | 中 | 离线预训练 + 在线查表 | +0.002~0.005 |
+| P3 | 匿名特征交叉 | 低 | 在线计算 | +0.001~0.002 |
+
+---
+
+### 4.2 P0：候选物品-序列匹配特征（最强信号）不行
+
+对 4 个 domain 的序列分别计算以下特征。由于特征匿名，假设每个序列的第一个 side-info fid 为 `item_id`（若实际不是，需调整 fid 索引）。
+
+| 特征名 | 计算方式 | 作用 |
+|--------|----------|------|
+| `{domain}_item_match_flag` | 候选 item_id ∈ 序列 item_ids ? 1 : 0 | 用户是否对该物品有过历史行为 |
+| `{domain}_item_match_count` | 候选 item_id 在序列中出现次数 | 重复交互 = 强兴趣信号 |
+| `{domain}_item_match_last_pos` | 候选 item_id 最近一次出现的位置（倒序，1=最近） | 越近相关性越高 |
+| `{domain}_item_match_time_diff` | 当前 timestamp - 候选 item_id 最近一次出现时间 | 时间衰减的精细建模 |
+
+**为什么对 AUC 排序有效**：排序任务的核心是 User-Item 匹配度评估。序列中的直接命中是模型难以通过 Attention 机制完全捕捉的硬信号——即使模型能学到，显式特征也能加速收敛并提升稳定性。
+
+**在线实现位置**：`dataset.py` 的 `_convert_batch` 中，在序列特征处理后、返回 result 前计算。
+
+```python
+# 伪代码示例
+candidate_item_ids = item_int[:, item_id_offset]  # (B,)
+for domain in self.seq_domains:
+    seq_items = result[domain][:, 0, :]  # 假设 slot 0 是 item_id, (B, seq_len)
+    # flag
+    match_flag = (seq_items == candidate_item_ids.unsqueeze(1)).any(dim=1).float()
+    # count
+    match_count = (seq_items == candidate_item_ids.unsqueeze(1)).sum(dim=1).float()
+    # last_pos: 倒序查找第一个匹配位置
+    ...
+```
+
+---
+
+### 4.3 P0：时间感知增强特征
+
+当前仅有 `time_bucket`（粗粒度分桶）。增加以下精细时间特征：
+
+| 特征名 | 计算方式 | 作用 |
+|--------|----------|------|
+| `{domain}_last_action_diff` | 当前 timestamp - 序列最近一次行为时间戳 | 用户活跃度/沉默度 |
+| `{domain}_time_decay_score` | Σ exp(-λ × Δt_i) | 近期行为加权聚合 |
+| `{domain}_time_gap_mean` | 序列内相邻行为时间差的均值 | 行为规律性 |
+| `{domain}_time_gap_std` | 序列内相邻行为时间差的方差 | 行为规律性波动 |
+
+**补充全局时间特征**：
+| 特征名 | 计算方式 |
+|--------|----------|
+| `hour_of_day` | `timestamp % 86400 // 3600` | 一天中的小时（周期性） |
+| `day_of_week` | `timestamp // 86400 % 7` | 星期几（周期性） |
+
+**为什么有效**：HyFormer 中的 `time_embedding` 只是绝对时间分桶的加法，无法显式建模**相对时间差**和**时间衰减**。BCE 损失下，时间敏感的样本（如近期活跃用户的正样本）会被更准确地 scoring。
+
+---
+
+### 4.4 P1：序列内部统计特征
+
+不依赖特征语义，仅从序列结构计算：
+
+| 特征名 | 计算方式 |
+|--------|----------|
+| `{domain}_seq_len` | 已有 |
+| `{domain}_unique_ratio` | 唯一 item 数 / seq_len | 兴趣集中度 |
+| `{domain}_repeat_count` | seq_len - 唯一 item 数 | 重复行为强度 |
+| `{domain}_top_freq` | 序列中出现最多次 item 的频率 | 主导兴趣强度 |
+
+**跨序列聚合**：
+| 特征名 | 计算方式 |
+|--------|----------|
+| `total_seq_len` | 4 个 domain seq_len 之和 |
+| `active_domain_count` | seq_len > 0 的 domain 数 |
+| `max_domain_ratio` | max(seq_len) / total_seq_len | 用户偏好哪个 domain |
+
+---
+
+### 4.5 P2：全局统计特征（离线预计算，收益通常最高）
+
+由于完整数据在平台，可以在**训练集**上预计算以下统计量。**必须做防穿越处理**。
+
+| 特征名 | 计算方式 | 防穿越方法 |
+|--------|----------|-----------|
+| `user_ctr` | 用户历史点击率 = 正样本数 / 总样本数 | 五折交叉统计 |
+| `item_ctr` | 物品历史点击率 | 五折交叉统计 |
+| `user_item_cooccur` | 用户-物品共现次数 | Leave-one-out |
+| `user_avg_seq_len` | 用户平均序列长度 | 五折交叉统计 |
+| `item_domain_dist` | 物品在各 domain 出现的分布熵 | 全局平滑 |
+
+**五折交叉统计流程**：
+1. 将训练数据随机分为 5 份
+2. 对每份数据，用其他 4 份计算统计量（如 CTR）
+3. 将统计量作为特征合并回原数据
+4. 冷启动用户/物品用全局均值填充
+
+**为什么对 BCE + AUC 最有效**：Target Encoding 直接将历史标签信息编码为特征，BCE 损失可以线性利用这些信号，AUC 对单调特征特别敏感。
+
+---
+
+### 4.6 P2：Embedding 相似度特征
+
+**方案 A：Item2Vec（无需平台数据，本地用 demo 预训练流程）**
+1. 提取所有序列中的 item_id 作为语料
+2. 用 Word2Vec/Skip-gram 训练 item embedding（dim=16/32）
+3. 保存 embedding 表，随代码提交到平台
+
+**在线计算特征**：
+| 特征名 | 计算方式 |
+|--------|----------|
+| `seq_item_emb_mean` | 序列中所有 item embedding 的均值 |
+| `candidate_emb` | 候选 item 的 embedding |
+| `emb_cos_sim` | cosine_similarity(seq_item_emb_mean, candidate_emb) | 兴趣匹配度 |
+
+**方案 B：User-Item 协同过滤向量**
+- 若平台允许，用矩阵分解（SVD/ALS）离线计算 user/item 隐向量
+- 在线计算 user 向量与 item 向量的内积作为特征
+
+---
+
+### 4.7 P3：匿名特征交叉
+
+由于特征匿名，只能做**盲目交叉**（blind crossing），收益不确定但可尝试：
+
+| 交叉方式 | 示例 |
+|----------|------|
+| 标量 ID 哈希交叉 | `hash(user_int_scalar_fid_1, item_int_scalar_fid_1) % vocab` |
+| 多值特征密度 | `user_int_array_15` 的非零元素占比 |
+| Dense 特征统计 | `user_dense` 各维度的均值/最大值 |
+
+**注意事项**：盲目交叉容易引入噪声，建议先用小数据验证有效性。
+
+---
+
+### 4.8 实施路线图（建议迭代顺序）
+
+```
+Week 1（快速验证）
+├── Step 1: 实现候选物品-序列匹配特征（flag/count/last_pos/time_diff）
+├── Step 2: 实现时间增强特征（last_action_diff, hour_of_day, day_of_week）
+└── 目标：AUC +0.003~0.005
+
+Week 2（深度挖掘）
+├── Step 3: 序列统计特征（unique_ratio, repeat_count, cross-domain聚合）
+├── Step 4: 尝试五折交叉的 user_ctr / item_ctr（若平台支持离线预计算）
+└── 目标：AUC +0.002~0.005
+
+Week 3（高阶特征）
+├── Step 5: Item2Vec embedding 相似度特征
+├── Step 6: 时间衰减加权 score（time_decay_sum）
+└── 目标：AUC +0.001~0.003
+```
+
+---
+
+### 4.9 风险与注意事项
+
+1. **穿越风险**：所有全局统计特征必须用五折交叉或 Leave-one-out，严禁用未来信息。
+2. **维度爆炸**：新增特征建议先作为 `user_dense` 或 `item_dense` 传入（连续值），而非扩展 `user_int`（离散值），避免 Embedding 层参数量激增。
+3. **本地验证局限**：demo 数据仅 1000 条，分布可能与全量差异巨大。特征工程代码需保证在任意规模数据上都能稳定运行（如冷启动填充）。
+4. **与模型协同**：HyFormer 已经能捕捉复杂的序列交互，特征工程应聚焦于**模型难以显式计算的统计量**（如全局 CTR、精确匹配信号），而非重复建模 Attention 已覆盖的能力。
+5. **BCE 损失特性**：BCE 对正负样本比例敏感。若数据极度不平衡，建议同步尝试 Focal Loss（项目中已支持 `--use_focal_loss`）。
+
