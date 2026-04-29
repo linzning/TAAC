@@ -72,3 +72,7 @@ tf_events/
 # Temporary files
 *.tmp
 .temp/
+
+# Project configuration (local only)
+CLAUDE.md
+MEMORY.md/
