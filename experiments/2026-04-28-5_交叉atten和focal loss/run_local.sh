@@ -7,10 +7,10 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate taac
 
 # 本地数据路径配置（相对于项目根目录）
-export TRAIN_DATA_PATH="${SCRIPT_DIR}/../demo_sample_1000"
+export TRAIN_DATA_PATH="/Users/linzhengning/project/TAAC/demo_sample_1000"
 export TRAIN_CKPT_PATH="${SCRIPT_DIR}/checkpoints"
 export TRAIN_LOG_PATH="${SCRIPT_DIR}/logs"
-export TRAIN_TF_EVENTS_PATH="${SCRIPT_DIR}/tf_events"
+export TRAIN_TF_EVENTS_PATH="${SCRIPT_DIR}/tf_events"！
 
 # 创建必要的输出目录
 mkdir -p "${TRAIN_CKPT_PATH}"
@@ -29,5 +29,8 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --num_workers 4 \
     --batch_size 32 \
     --num_epochs 3 \
+    --loss_type focal \
+    --focal_alpha 0.25 \
+    --focal_gamma 2.0 \
     --valid_ratio 0.0 \
     "$@"

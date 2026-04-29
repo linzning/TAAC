@@ -7,7 +7,7 @@ source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate taac
 
 # 本地数据路径配置（相对于项目根目录）
-export TRAIN_DATA_PATH="${SCRIPT_DIR}/../demo_sample_1000"
+export TRAIN_DATA_PATH="${SCRIPT_DIR}/../../demo_sample_1000"
 export TRAIN_CKPT_PATH="${SCRIPT_DIR}/checkpoints"
 export TRAIN_LOG_PATH="${SCRIPT_DIR}/logs"
 export TRAIN_TF_EVENTS_PATH="${SCRIPT_DIR}/tf_events"

@@ -3,11 +3,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PYTHONPATH="${SCRIPT_DIR}:${PYTHONPATH}"
 
 # ---- Active config: RankMixer NS tokenizer (no ns_groups.json required) ----
+# 方案2: d_model=96, num_queries=4, T=24
 python3 -u "${SCRIPT_DIR}/train.py" \
+    --d_model 96 \
     --ns_tokenizer_type rankmixer \
     --user_ns_tokens 5 \
     --item_ns_tokens 2 \
-    --num_queries 2 \
+    --num_queries 4 \
     --ns_groups_json "" \
     --emb_skip_threshold 1000000 \
     --num_workers 8 \

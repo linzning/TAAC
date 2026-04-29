@@ -1272,6 +1272,7 @@ class PCVRHyFormer(nn.Module):
         user_ns_tokens: int = 0,
         item_ns_tokens: int = 0,
         use_inter_seq_attn: bool = False,
+        use_seq_stats: bool = True,
     ) -> None:
         super().__init__()
 
@@ -1457,6 +1458,18 @@ class PCVRHyFormer(nn.Module):
         else:
             self.rotary_emb = None
 
+        # ================== Sequence Internal Statistics ==================
+        self.use_seq_stats = use_seq_stats
+        if use_seq_stats:
+            # 每域 4 维(seq_len, unique_ratio, repeat_count, top_freq) + 跨域 3 维
+            num_seq_stats = 4 * self.num_sequences + 3
+            self.seq_stats_proj = nn.Sequential(
+                nn.Linear(num_seq_stats, d_model),
+                nn.LayerNorm(d_model),
+                nn.SiLU(),
+                nn.Dropout(dropout_rate),
+            )
+
         # Output projection
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
@@ -1626,6 +1639,78 @@ class PCVRHyFormer(nn.Module):
         idx = torch.arange(max_len, device=device).unsqueeze(0)  # (1, max_len)
         return idx >= seq_len.unsqueeze(1)  # (B, max_len)
 
+    @torch.no_grad()
+    def _compute_seq_stats(
+        self,
+        seq_data: dict,
+        seq_lens: dict,
+    ) -> torch.Tensor:
+        """计算序列内部统计特征与跨序列聚合特征。
+
+        取每个 domain 的第 0 个 feature slot 作为序列主 ID，统计：
+        - unique_ratio: 唯一 item 数 / seq_len
+        - repeat_count: seq_len - 唯一 item 数
+        - top_freq: 最频繁 item 出现次数 / seq_len
+
+        跨序列聚合：
+        - total_seq_len: 所有 domain seq_len 之和
+        - active_domain_count: seq_len > 0 的 domain 数
+        - max_domain_ratio: max(seq_len) / total_seq_len
+
+        Args:
+            seq_data: {domain: [B, S, L]}
+            seq_lens: {domain: [B]}
+
+        Returns:
+            [B, 4*num_sequences + 3] 的统计特征张量。
+        """
+        device = seq_lens[self.seq_domains[0]].device
+        B = seq_lens[self.seq_domains[0]].shape[0]
+
+        domain_stats = []
+        for domain in self.seq_domains:
+            item_ids = seq_data[domain][:, 0, :]  # [B, L]
+            lens = seq_lens[domain].float()       # [B]
+            max_len = item_ids.shape[1]
+            # padding mask: seq_len 之后的为 padding
+            idx = torch.arange(max_len, device=device).unsqueeze(0)
+            mask = idx < seq_lens[domain].unsqueeze(1)  # [B, L], True=valid
+
+            unique_ratio = torch.empty(B, device=device)
+            repeat_count = torch.empty(B, device=device)
+            top_freq = torch.empty(B, device=device)
+
+            for b in range(B):
+                valid_ids = item_ids[b][mask[b]]
+                valid_len = valid_ids.numel()
+                if valid_len == 0:
+                    unique_ratio[b] = 0.0
+                    repeat_count[b] = 0.0
+                    top_freq[b] = 0.0
+                else:
+                    unique_vals = torch.unique(valid_ids)
+                    ucount = unique_vals.numel()
+                    unique_ratio[b] = ucount / valid_len
+                    repeat_count[b] = valid_len - ucount
+
+                    # 最频繁 item 的频率
+                    counts = torch.stack([(valid_ids == v).sum().float() for v in unique_vals])
+                    top_freq[b] = counts.max().item() / valid_len
+
+            stats = torch.stack([lens, unique_ratio, repeat_count, top_freq], dim=1)
+            domain_stats.append(stats)
+
+        all_domain_stats = torch.cat(domain_stats, dim=1)  # [B, 4*S]
+
+        # 跨序列聚合
+        lens_tensor = torch.stack([seq_lens[d].float() for d in self.seq_domains], dim=1)
+        total_len = lens_tensor.sum(dim=1)
+        active_count = (lens_tensor > 0).sum(dim=1).float()
+        max_ratio = lens_tensor.max(dim=1)[0] / total_len.clamp(min=1.0)
+        cross_stats = torch.stack([total_len, active_count, max_ratio], dim=1)  # [B, 3]
+
+        return torch.cat([all_domain_stats, cross_stats], dim=1)  # [B, 4*S + 3]
+
     def _run_multi_seq_blocks(
         self,
         q_tokens_list: list,
@@ -1715,7 +1800,13 @@ class PCVRHyFormer(nn.Module):
             apply_dropout=self.training
         )
 
-        # 5. Classifier
+        # 5. 融入序列内部统计特征
+        if self.use_seq_stats:
+            seq_stats = self._compute_seq_stats(inputs.seq_data, inputs.seq_lens)
+            stats_emb = self.seq_stats_proj(seq_stats)
+            output = output + stats_emb
+
+        # 6. Classifier
         logits = self.clsfier(output)  # (B, action_num)
         return logits
 
@@ -1754,6 +1845,12 @@ class PCVRHyFormer(nn.Module):
             q_tokens_list, ns_tokens, seq_tokens_list, seq_masks_list,
             apply_dropout=False
         )
+
+        # 融入序列内部统计特征
+        if self.use_seq_stats:
+            seq_stats = self._compute_seq_stats(inputs.seq_data, inputs.seq_lens)
+            stats_emb = self.seq_stats_proj(seq_stats)
+            output = output + stats_emb
 
         logits = self.clsfier(output)
         return logits, output

@@ -24,41 +24,98 @@ class ModelInput(NamedTuple):
 
 
 class RotaryEmbedding(nn.Module):
-    """Precomputes and caches RoPE cos/sin values.
+    """Rotary Position Embedding (RoPE) 旋转位置编码模块。
+
+    基于论文《RoFormer: Enhanced Transformer with Rotary Position Embedding》实现。
+    核心思想：通过旋转矩阵将绝对位置信息注入到注意力机制中的相对位置表示中，
+    使得内积运算能够自然地编码相对位置信息。
+
+    数学原理：
+        对于位置 m 的向量 x，将其按维度两两分组，对每组应用旋转矩阵：
+        [x_{2i}  ]   [cos(m*θ_i)  -sin(m*θ_i)] [x_{2i}  ]
+        [x_{2i+1}] = [sin(m*θ_i)   cos(m*θ_i)] [x_{2i+1}]
+        其中 θ_i = base^{-2i/dim}，i ∈ [0, dim/2)
+
+    预计算策略：
+        在初始化时预先计算并缓存 cos/sin 值，forward 时仅做切片和 device 转移，
+        避免运行时重复计算，同时保证与 torch.compile() 的兼容性。
 
     Attributes:
-        dim: Rotary embedding dimension.
-        max_seq_len: Maximum sequence length for cache.
-        base: Base frequency for rotary encoding.
+        dim: 旋转位置编码的维度，必须是偶数。对应注意力头中 key/query 向量的维度。
+        max_seq_len: 缓存的最大序列长度，默认 2048。超过该长度需重新初始化。
+        base: 旋转角度频率基数，默认 10000.0。控制位置编码的波长，
+              值越大，长距离位置的区分度越低（波长越长）。
     """
 
     def __init__(self, dim: int, max_seq_len: int = 2048, base: float = 10000.0) -> None:
+        """初始化 RoPE 模块并预计算缓存。
+
+        Args:
+            dim: 旋转编码维度（必须是偶数，用于两两分组旋转）。
+            max_seq_len: 最大序列长度，默认 2048。决定缓存大小。
+            base: 频率基数，默认 10000.0。
+        """
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
 
-        # Precompute inv_freq: (dim // 2,)
+        # 预计算每对维度的旋转角度倒数 inv_freq，形状为 (dim // 2,)
+        # 公式：1 / (base ^ (2i / dim))，其中 i 取值范围为 [0, dim/2)
+        # 该频率向量与位置索引 m 相乘后得到实际旋转角度
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        # persistent=False：该缓冲区不参与模型保存/加载（可运行时重建）
         self.register_buffer('inv_freq', inv_freq, persistent=False)
 
-        # Precompute cache
+        # 预计算全量 cos/sin 缓存
         self._build_cache(max_seq_len)
 
     def _build_cache(self, seq_len: int) -> None:
+        """构建位置编码缓存。
+
+        计算从位置 0 到 seq_len-1 的所有 cos/sin 值，并注册为 persistent=False 的 buffer。
+        仅在初始化或序列长度扩展时调用一次。
+
+        Args:
+            seq_len: 需要缓存的序列长度。
+
+        张量形状流转：
+            t:      (seq_len,)
+            freqs:  (seq_len, dim // 2)  # 外积：每个位置 × 每个频率
+            emb:    (seq_len, dim)        # 复制拼接为完整维度
+            cached: (1, seq_len, dim)      # 添加 batch 维度便于广播
+        """
+        # 生成位置索引向量 t = [0, 1, 2, ..., seq_len-1]
         t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=self.inv_freq.device)
+
+        # 计算每个位置在每个频率上的旋转角度：outer(t, inv_freq) = t_i * inv_freq_j
         freqs = torch.outer(t, self.inv_freq)  # (seq_len, dim // 2)
+
+        # 将 freqs 沿最后一个维度复制一份并拼接，得到 (seq_len, dim)
+        # 因为旋转操作是逐对进行的，每对维度共享相同的旋转角度
         emb = torch.cat([freqs, freqs], dim=-1)  # (seq_len, dim)
+
+        # 预计算并缓存 cos 和 sin 值，添加维度 (1, seq_len, dim) 便于后续广播到 batch 维度
         self.register_buffer('cos_cached', emb.cos().unsqueeze(0), persistent=False)  # (1, seq_len, dim)
         self.register_buffer('sin_cached', emb.sin().unsqueeze(0), persistent=False)  # (1, seq_len, dim)
 
     def forward(self, seq_len: int, device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Computes cos/sin values for the given sequence length.
+        """根据目标序列长度和设备返回预计算的 cos/sin 缓存切片。
 
-        Returns pre-computed slices from the cache. The cache is built once
-        in __init__ with max_seq_len; no runtime expansion is performed so
-        that the forward pass remains compatible with torch.compile().
+        运行时仅执行切片和 device 转移操作，时间复杂度 O(1)，不影响 torch.compile()。
+
+        Args:
+            seq_len: 当前输入序列的实际长度（必须 <= max_seq_len）。
+            device: 目标计算设备（如 cuda/cpu），用于将缓存转移到正确设备。
+
+        Returns:
+            cos: 形状为 (1, seq_len, dim) 的余弦缓存。
+            sin: 形状为 (1, seq_len, dim) 的正弦缓存。
+
+        Raises:
+            IndexError: 当 seq_len > max_seq_len 时，切片操作可能越界。
         """
+        # 从缓存中截取前 seq_len 个位置，并转移到目标设备
         cos = self.cos_cached[:, :seq_len, :].to(device)
         sin = self.sin_cached[:, :seq_len, :].to(device)
         return cos, sin
@@ -115,11 +172,32 @@ class SwiGLU(nn.Module):
 
 
 class RoPEMultiheadAttention(nn.Module):
-    """Multi-head attention with Rotary Position Embedding support.
+    """支持 Rotary Position Embedding (RoPE) 的多头自注意力模块。
 
-    Manually projects Q/K/V and reshapes for multi-head, then injects RoPE
-    after projection and before dot-product. Uses F.scaled_dot_product_attention
-    for efficient computation.
+    本模块实现了标准的 Multi-Head Self-Attention (MHSA) 机制，并在 Q/K 向量上注入
+    旋转位置编码。区别于 PyTorch 原生 nn.MultiheadAttention，本实现手动完成
+    Q/K/V 投影与 reshape，以便在点积前精确控制 RoPE 的注入时机。
+
+    核心计算流程：
+        1. 线性投影：query/key/value → Q/K/V，形状 (B, L, D)
+        2. 多头拆分：将 D 拆分为 num_heads × head_dim，转置为 (B, num_heads, L, head_dim)
+        3. RoPE 注入：对 Q 和 K 分别应用旋转位置编码（V 不加位置信息）
+        4. 缩放点积注意力：调用 F.scaled_dot_product_attention 高效计算
+        5. 门控融合：通过 sigmoid 门控 G 对注意力输出进行自适应加权
+        6. 输出投影：合并多头结果并映射回 d_model 维度
+
+    门控机制说明：
+        输出 = W_o(out) * sigmoid(W_g(query))，其中 W_g 初始化为零权重、偏置 1.0，
+        使得初始状态下门控近似恒等映射（sigmoid(1.0) ≈ 0.731），训练过程中逐步学习
+        对注意力输出的自适应抑制/增强。
+
+    Attributes:
+        d_model: 模型维度，默认 64。必须是 num_heads 的整数倍。
+        num_heads: 注意力头数，默认 4。决定并行注意力子空间的数量。
+        head_dim: 每个注意力头的维度，等于 d_model // num_heads。
+        rope_on_q: 是否为 Q 侧应用 RoPE，默认 True。在交叉注意力中可设为 False，
+                   使 Q 侧（如全局查询 token）不携带序列位置信息。
+        dropout: 注意力 dropout 概率，默认 0.0。仅在 training=True 时生效。
     """
 
     def __init__(
@@ -129,6 +207,14 @@ class RoPEMultiheadAttention(nn.Module):
         dropout: float = 0.0,
         rope_on_q: bool = True,
     ) -> None:
+        """初始化多头注意力模块及投影矩阵。
+
+        Args:
+            d_model: 模型特征维度，必须是 num_heads 的整数倍。
+            num_heads: 注意力头数。
+            dropout: 注意力权重 dropout 概率，默认 0.0。
+            rope_on_q: 是否为 query 侧应用 RoPE，默认 True。
+        """
         super().__init__()
         self.d_model = d_model
         self.num_heads = num_heads
@@ -136,15 +222,21 @@ class RoPEMultiheadAttention(nn.Module):
         self.rope_on_q = rope_on_q
         self.dropout = dropout
 
+        # 保证模型维度可被头数整除，否则 reshape 会失败
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
+        # Q/K/V/O 投影矩阵：均将 d_model 映射到 d_model
+        # 标准 Transformer 中输出投影 W_o 承担合并多头的职责
         self.W_q = nn.Linear(d_model, d_model)
         self.W_k = nn.Linear(d_model, d_model)
         self.W_v = nn.Linear(d_model, d_model)
         self.W_o = nn.Linear(d_model, d_model)
-        self.W_g = nn.Linear(d_model, d_model)
 
+        # 门控投影 W_g：生成与输出同维度的门控信号，用于自适应调节注意力贡献
+        self.W_g = nn.Linear(d_model, d_model)
+        # 零权重初始化：初始门控信号仅由偏置决定
         nn.init.zeros_(self.W_g.weight)
+        # 偏置初始化为 1.0：sigmoid(1.0) ≈ 0.731，近似恒等门控
         nn.init.constant_(self.W_g.bias, 1.0)
 
     def forward(
@@ -160,68 +252,94 @@ class RoPEMultiheadAttention(nn.Module):
         q_rope_sin: Optional[torch.Tensor] = None,
         need_weights: bool = False,
     ) -> tuple:
-        """Computes multi-head attention with optional RoPE.
+        """执行带 RoPE 的多头注意力前向计算。
+
+        完整的数据流形状：
+            query (B, Lq, D) ──W_q──→ Q (B, Lq, D) ──reshape──→ (B, H, Lq, Hd)
+            key   (B, Lk, D) ──W_k──→ K (B, Lk, D) ──reshape──→ (B, H, Lk, Hd)
+            value (B, Lk, D) ──W_v──→ V (B, Lk, D) ──reshape──→ (B, H, Lk, Hd)
+                                      ↓ RoPE 注入
+                                Q_rot, K_rot ──SDPA──→ out (B, H, Lq, Hd)
+                                      ↓ 合并 + 门控 + 输出投影
+                                output (B, Lq, D)
 
         Args:
-            query: (B, Lq, D)
-            key: (B, Lk, D)
-            value: (B, Lk, D)
-            key_padding_mask: (B, Lk), True indicates padding positions.
-            attn_mask: (Lq, Lk) or (B*num_heads, Lq, Lk), additive mask.
-            rope_cos: (1, L, head_dim), RoPE for KV side (also used for Q
-                unless q_rope_* is provided).
-            rope_sin: Same shape as rope_cos.
-            q_rope_cos: (B, Lq, head_dim) or (1, Lq, head_dim), Q-specific
-                RoPE for cross-attention with gathered positions.
-            q_rope_sin: Same shape as q_rope_cos.
-            need_weights: Compatibility parameter, not used.
+            query: 查询张量，形状 (B, Lq, D)。B 为 batch size，Lq 为查询序列长度。
+            key: 键张量，形状 (B, Lk, D)。Lk 为键/值序列长度。
+            value: 值张量，形状 (B, Lk, D)。通常 key 与 value 来自同一来源。
+            key_padding_mask: 键侧填充掩码，形状 (B, Lk)。
+                              True 表示该位置为填充（padding），不应被注意力关注。
+            attn_mask: 注意力掩码，形状 (Lq, Lk) 或 (B*H, Lq, Lk)。
+                       采用加法掩码形式：值为 -inf 的位置表示禁止关注，0 表示允许关注。
+            rope_cos: RoPE 余弦缓存，形状 (1, L, head_dim)。
+                      用于 KV 侧的位置编码；当未提供 q_rope_cos 时，也复用于 Q 侧。
+            rope_sin: RoPE 正弦缓存，形状与 rope_cos 相同。用于 KV 侧。
+            q_rope_cos: Q 侧专用 RoPE 余弦缓存，形状 (B, Lq, head_dim) 或 (1, Lq, head_dim)。
+                        在交叉注意力场景中使用（如 LongerEncoder 的 top-k 聚合位置），
+                        使 Q 侧位置编码与 KV 侧解耦。
+            q_rope_sin: Q 侧专用 RoPE 正弦缓存，形状与 q_rope_cos 相同。
+            need_weights: 兼容性参数，始终返回 None，不返回注意力权重。
 
         Returns:
-            Tuple of (output, None).
+            Tuple[Tensor, None]:
+                - output: 注意力输出，形状 (B, Lq, D)。
+                - None: 占位符，保持与 nn.MultiheadAttention 的接口兼容。
         """
         B, Lq, _ = query.shape
         Lk = key.shape[1]
 
-        # 1. Linear projection
+        # ── Step 1: 线性投影 ──
+        # 分别通过独立线性层将输入映射到 Q/K/V 空间
         Q = self.W_q(query)  # (B, Lq, D)
         K = self.W_k(key)    # (B, Lk, D)
         V = self.W_v(value)  # (B, Lk, D)
 
-        # 2. Reshape to (B, num_heads, L, head_dim)
+        # ── Step 2: 多头拆分 ──
+        # view: 将最后一个维度 D 拆分为 (num_heads, head_dim)
+        # transpose: 将 head 维度提到序列长度前，便于后续并行计算
+        # 最终形状：(B, num_heads, L, head_dim)
         Q = Q.view(B, Lq, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(B, Lk, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # 3. Apply RoPE independently to Q and K
+        # ── Step 3: 应用 RoPE 旋转位置编码 ──
+        # RoPE 仅作用于 Q 和 K，V 不添加位置信息（值向量不需要位置感知）
         if rope_cos is not None and rope_sin is not None:
-            # K always uses rope_cos/rope_sin (KV-side positional encoding)
+            # K 侧始终使用 rope_cos/rope_sin（标准 KV 位置编码）
             K = apply_rope_to_tensor(K, rope_cos, rope_sin)
 
             if self.rope_on_q:
-                # Q side: prefer dedicated q_rope_cos/sin (top_k positions in LongerEncoder cross-attn)
+                # Q 侧优先使用专用的 q_rope_cos/sin（如交叉注意力中 gathered 的位置）
+                # 若未提供专用缓存，则回退到与 K 侧共享的 rope_cos/sin
                 q_cos = q_rope_cos if q_rope_cos is not None else rope_cos
                 q_sin = q_rope_sin if q_rope_sin is not None else rope_sin
                 Q = apply_rope_to_tensor(Q, q_cos, q_sin)
 
-        # 4. Convert key_padding_mask to SDPA format
+        # ── Step 4: 掩码格式转换（适配 SDPA）──
+        # PyTorch 的 scaled_dot_product_attention 要求 attn_mask 为 bool 类型，
+        # True 表示"允许关注"，False 表示"忽略"。
         sdpa_attn_mask = None
         if key_padding_mask is not None:
-            # key_padding_mask: (B, Lk), True = padding
-            # SDPA expects (B, 1, 1, Lk) bool mask, True = attend
+            # key_padding_mask: (B, Lk)，True = padding（需忽略）
+            # SDPA 期望: (B, num_heads, Lq, Lk)，True = attend（允许关注）
+            # 因此先取反 (~)，再扩展维度以广播到所有头和查询位置
             sdpa_attn_mask = ~key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, Lk)
             sdpa_attn_mask = sdpa_attn_mask.expand(B, self.num_heads, Lq, Lk)
 
         if attn_mask is not None:
-            # attn_mask: additive float mask (Lq, Lk), -inf means do not attend
-            # Convert to bool: positions that are not -inf are True
+            # attn_mask: 加法掩码，-inf 表示禁止关注，0 表示允许关注
+            # 转换为 bool：值为 0 的位置为 True（允许关注）
             bool_attn = (attn_mask == 0)  # (Lq, Lk)
+            # 扩展到 (B, num_heads, Lq, Lk) 以匹配 SDPA 的广播要求
             bool_attn = bool_attn.unsqueeze(0).unsqueeze(0).expand(B, self.num_heads, Lq, Lk)
             if sdpa_attn_mask is not None:
+                # 两种掩码取交集：同时满足填充掩码和注意力掩码的位置才允许关注
                 sdpa_attn_mask = sdpa_attn_mask & bool_attn
             else:
                 sdpa_attn_mask = bool_attn
 
-        # 5. Scaled Dot-Product Attention
+        # ── Step 5: 缩放点积注意力（SDPA）──
+        # 调用 PyTorch 优化内核，自动选择 FlashAttention / Memory-Efficient Attention / Cudnn 后端
         dropout_p = self.dropout if self.training else 0.0
         out = F.scaled_dot_product_attention(
             Q, K, V,
@@ -229,13 +347,21 @@ class RoPEMultiheadAttention(nn.Module):
             dropout_p=dropout_p,
         )  # (B, num_heads, Lq, head_dim)
 
-        # Replace NaN from all-padding softmax with 0 (zero vectors preserve original input via residual)
+        # 处理全填充序列的边界情况：当某条序列所有 key 位置均为 padding 时，
+        # softmax 的分母为 0，导致输出 NaN。将其替换为 0，使得残差连接后
+        # 输出近似等于原始输入（零向量不改变加法结果）。
         out = torch.nan_to_num(out, nan=0.0)
 
-        # 6. Reshape back and output projection
+        # ── Step 6: 合并多头、门控加权与输出投影 ──
+        # transpose: (B, num_heads, Lq, head_dim) → (B, Lq, num_heads, head_dim)
+        # contiguous + view: 合并多头维度为 (B, Lq, d_model)
         out = out.transpose(1, 2).contiguous().view(B, Lq, self.d_model)
+
+        # 门控信号：基于原始 query 生成逐元素权重，sigmoid 保证范围在 (0, 1)
         G = self.W_g(query)
         out = out * torch.sigmoid(G)
+
+        # 最终线性投影：将门控后的注意力输出映射回 d_model 维度
         out = self.W_o(out)
 
         return out, None
@@ -331,28 +457,54 @@ class RankMixerBlock(nn.Module):
         dropout: float = 0.0,
         mode: str = 'full'  # 'full' | 'ffn_only' | 'none'
     ) -> None:
+        """初始化 RankMixerBlock 实例。
+
+        根据 mode 参数决定模块行为：
+        - 'full'  : 启用 Token Mixing + Per-token FFN + 残差连接（完整功能）。
+        - 'ffn_only': 仅启用 Per-token FFN + 残差连接（跳过 Token Mixing）。
+        - 'none'  : 纯恒等映射，不创建任何子模块，forward 直接返回输入。
+
+        Args:
+            d_model (int): 模型隐藏维度，即每个 token 的向量维度 D。
+            n_total (int): 输入序列总长度 T = Nq + Nns（查询 token 数 + 负采样 token 数）。
+            hidden_mult (int, optional): FFN 中间层维度相对于 d_model 的倍数。
+                中间层实际维度为 d_model * hidden_mult。默认为 4。
+            dropout (float, optional): FFN 中的 Dropout 概率。默认为 0.0。
+            mode (str, optional): 模块运行模式，可选 'full'、'ffn_only'、'none'。默认为 'full'。
+
+        Raises:
+            ValueError: 当 mode='full' 且 d_model 无法被 n_total 整除时抛出。
+                Token Mixing 要求将 D 维均分为 T 个子空间，因此必须满足整除约束。
+        """
         super().__init__()
         self.T = n_total
         self.D = d_model
         self.mode = mode
 
+        # ---------------------------- 模式分支处理 ----------------------------
         if mode == 'none':
             # Pure identity mapping, no submodules created
+            # 纯恒等映射：不创建任何可训练子模块，forward 直接透传输入
             return
 
         if mode == 'full':
+            # Token Mixing 要求将 d_model 均分为 n_total 个子空间
             if d_model % n_total != 0:
                 raise ValueError(
                     f"d_model={d_model} must be divisible by T={n_total} for token mixing."
                 )
-            self.d_sub = d_model // n_total
+            self.d_sub = d_model // n_total  # 每个子空间的维度 d_sub = D / T
 
-        # Per-token FFN (shared parameters) — used by both 'full' and 'ffn_only'
-        self.norm = nn.LayerNorm(d_model)
-        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)
-        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)
-        self.dropout = nn.Dropout(dropout)
+        # ---------------------------- Per-token FFN 定义 ----------------------------
+        # 所有 token 共享同一套 FFN 参数（共享权重），适用于 'full' 和 'ffn_only' 两种模式
+        self.norm = nn.LayerNorm(d_model)  # FFN 前的层归一化，稳定输入分布
+        self.fc1 = nn.Linear(d_model, d_model * hidden_mult)  # 升维投影：D -> D * hidden_mult
+        self.fc2 = nn.Linear(d_model * hidden_mult, d_model)  # 降维投影：D * hidden_mult -> D
+        self.dropout = nn.Dropout(dropout)  # 防止过拟合的随机失活层
+
+        # ---------------------------- 残差后处理 ----------------------------
         # Post-LN after residual to stabilize stacked block outputs
+        # 在残差连接之后进行层归一化，缓解深层网络堆叠时的数值不稳定问题
         self.post_norm = nn.LayerNorm(d_model)
 
     def token_mixing(self, Q: torch.Tensor) -> torch.Tensor:
@@ -429,28 +581,55 @@ class MultiSeqQueryGenerator(nn.Module):
         num_sequences: int,
         hidden_mult: int = 4
     ) -> None:
-        super().__init__()
-        self.num_queries = num_queries
-        self.num_sequences = num_sequences
-        self.d_model = d_model
+        """初始化 MultiSeqQueryGenerator 实例。
 
+        为每条序列独立构建查询生成网络。核心思想是：
+        将共享的 NS tokens 与该条序列的均值池化特征拼接为全局信息向量，
+        再通过序列专属、查询独立的 FFN 网络生成 Nq 个查询 token。
+
+        Args:
+            d_model (int): 模型隐藏维度 D，所有 token 和全局信息向量的维度基础。
+            num_ns (int): 负采样 token 数量 M，即共享 NS tokens 的个数。
+            num_queries (int): 每条序列需要生成的查询 token 数量 Nq。
+            num_sequences (int): 输入序列的总条数 S。
+            hidden_mult (int, optional): 每个查询 FFN 中间层维度相对于 d_model 的倍数。
+                中间层实际维度为 d_model * hidden_mult。默认为 4。
+        """
+        super().__init__()
+        self.num_queries = num_queries    # 每条序列生成的查询 token 数 Nq
+        self.num_sequences = num_sequences  # 序列总数 S
+        self.d_model = d_model            # 隐藏维度 D
+
+        # ---------------------------- 全局信息维度计算 ----------------------------
+        # GlobalInfo_i = Concat(F1..FM, MeanPool(Seq_i))
+        # NS tokens 扁平化后维度 = num_ns * d_model，序列池化后维度 = d_model
+        # 因此全局信息总维度 = (num_ns + 1) * d_model
         global_info_dim = (num_ns + 1) * d_model
 
+        # ---------------------------- 全局信息层归一化 ----------------------------
         # LayerNorm on global_info to prevent gradient explosion from large-dim concat
+        # 对拼接后的高维全局信息向量进行层归一化，防止大维度拼接导致梯度爆炸
         self.global_info_norm = nn.LayerNorm(global_info_dim)
 
+        # ---------------------------- 查询生成 FFN 网络 ----------------------------
         # Each sequence has N independent FFNs
+        # 构建嵌套 ModuleList 结构：外层按序列索引，内层按查询索引
+        # 总参数量 = S * Nq 个独立 FFN，每个 FFN 结构为：
+        #   Linear(global_info_dim -> d_model * hidden_mult)
+        #   -> SiLU 激活
+        #   -> Linear(d_model * hidden_mult -> d_model)
+        #   -> LayerNorm(d_model)
         self.query_ffns_per_seq = nn.ModuleList([
             nn.ModuleList([
                 nn.Sequential(
-                    nn.Linear(global_info_dim, d_model * hidden_mult),
-                    nn.SiLU(),
-                    nn.Linear(d_model * hidden_mult, d_model),
-                    nn.LayerNorm(d_model),
+                    nn.Linear(global_info_dim, d_model * hidden_mult),  # 升维投影
+                    nn.SiLU(),  # Swish 激活函数：x * sigmoid(x)，平滑非线性
+                    nn.Linear(d_model * hidden_mult, d_model),  # 降维投影回 D 维
+                    nn.LayerNorm(d_model),  # 输出层归一化，稳定查询 token 分布
                 )
-                for _ in range(num_queries)
+                for _ in range(num_queries)  # 为当前序列创建 Nq 个独立 FFN
             ])
-            for _ in range(num_sequences)
+            for _ in range(num_sequences)  # 为 S 条序列各创建一组查询生成器
         ])
 
     def forward(
@@ -869,12 +1048,38 @@ class MultiSeqHyFormerBlock(nn.Module):
         causal: bool = False,
         rank_mixer_mode: str = 'full'
     ) -> None:
-        super().__init__()
-        self.num_sequences = num_sequences
-        self.num_queries = num_queries
-        self.num_ns = num_ns
+        """初始化 MultiSeqHyFormerBlock 实例。
 
+        该模块是多序列 HyFormer 的核心构建块，包含三个子阶段：
+        1. Sequence Evolution：为每条序列独立进行序列编码（如 SwiGLU / Transformer / Longer）。
+        2. Query Decoding：为每条序列独立进行交叉注意力（Query tokens 关注编码后的序列）。
+        3. Query Boosting：将所有序列的 Query tokens 与共享 NS tokens 合并，
+           通过 RankMixerBlock 进行联合增强。
+
+        Args:
+            d_model (int): 模型隐藏维度 D。
+            num_heads (int): 注意力头数，用于交叉注意力模块。
+            num_queries (int): 每条序列生成的查询 token 数量 Nq。
+            num_ns (int): 共享负采样 token 数量 Nns。
+            num_sequences (int): 输入序列的总条数 S。
+            seq_encoder_type (str, optional): 序列编码器类型，可选 'swiglu'、'transformer'、'longer'。
+                默认为 'swiglu'。
+            hidden_mult (int, optional): FFN / 编码器中间层维度相对于 d_model 的倍数。默认为 4。
+            dropout (float, optional): Dropout 概率，应用于编码器和交叉注意力。默认为 0.0。
+            top_k (int, optional): LongerEncoder 的 top-k 稀疏注意力参数。默认为 50。
+            causal (bool, optional): 是否启用因果掩码（用于 LongerEncoder）。默认为 False。
+            rank_mixer_mode (str, optional): RankMixerBlock 运行模式，可选 'full'、'ffn_only'、'none'。
+                默认为 'full'。
+        """
+        super().__init__()
+        self.num_sequences = num_sequences  # 序列总数 S
+        self.num_queries = num_queries      # 每条序列的查询 token 数 Nq
+        self.num_ns = num_ns                # 共享 NS token 数 Nns
+
+        # ---------------------------- 序列编码器（Sequence Evolution） ----------------------------
         # Independent sequence encoder per sequence
+        # 为每条序列独立创建一个序列编码器，各序列的编码过程互不干扰
+        # 编码器类型由 seq_encoder_type 决定（SwiGLU / Transformer / Longer）
         self.seq_encoders = nn.ModuleList([
             create_sequence_encoder(
                 encoder_type=seq_encoder_type,
@@ -885,10 +1090,14 @@ class MultiSeqHyFormerBlock(nn.Module):
                 top_k=top_k,
                 causal=causal
             )
-            for _ in range(num_sequences)
+            for _ in range(num_sequences)  # 共 S 个独立编码器
         ])
 
+        # ---------------------------- 交叉注意力（Query Decoding） ----------------------------
         # Independent cross-attention per sequence
+        # 为每条序列独立创建一个交叉注意力模块
+        # Query tokens 作为 Query，编码后的序列特征作为 Key 和 Value
+        # ln_mode='pre' 表示在注意力前进行层归一化（Pre-LN 架构）
         self.cross_attns = nn.ModuleList([
             CrossAttention(
                 d_model=d_model,
@@ -896,10 +1105,13 @@ class MultiSeqHyFormerBlock(nn.Module):
                 dropout=dropout,
                 ln_mode='pre'
             )
-            for _ in range(num_sequences)
+            for _ in range(num_sequences)  # 共 S 个独立交叉注意力模块
         ])
 
+        # ---------------------------- RankMixer（Query Boosting） ----------------------------
         # RankMixer: input token count = Nq * S + Nns
+        # 将所有序列的查询 token 与共享 NS tokens 拼接后送入 RankMixer
+        # 总 token 数 = 每条序列 Nq 个查询 × S 条序列 + Nns 个共享 NS token
         n_total = num_queries * num_sequences + num_ns
         self.mixer = RankMixerBlock(
             d_model=d_model,
@@ -996,23 +1208,56 @@ class GroupNSTokenizer(nn.Module):
     def __init__(self, feature_specs: List[Tuple[int, int, int]],
                  groups: List[List[int]], emb_dim: int, d_model: int,
                  emb_skip_threshold: int = 0) -> None:
-        super().__init__()
-        self.feature_specs = feature_specs
-        self.groups = groups
-        self.emb_dim = emb_dim
-        self.emb_skip_threshold = emb_skip_threshold
+        """初始化 GroupNSTokenizer 实例。
 
+        将离散特征按组进行嵌入和投影，每组生成一个 NS token。
+        工作流程：
+        1. 为每个特征 fid 创建 Embedding 表（高基数特征可选择跳过）。
+        2. 对多值特征进行均值池化，单值特征直接查表。
+        3. 将每组内所有特征的嵌入向量拼接，通过投影层映射到 d_model 维度。
+
+        Args:
+            feature_specs (List[Tuple[int, int, int]]): 每个特征的三元组信息列表，
+                每个元组格式为 (vocab_size, offset, length)。
+                - vocab_size: 该特征的词典大小（决定 Embedding 表行数）。
+                - offset: 该特征在 int_feats 张量中的起始列索引。
+                - length: 该特征的取值个数（1 表示单值特征，>1 表示多值特征）。
+            groups (List[List[int]]): 特征分组列表，每个组是 fid 索引的列表。
+                每组内的特征嵌入后拼接，再投影为一个 NS token。
+            emb_dim (int): 每个特征的嵌入维度。
+            d_model (int): 模型隐藏维度，即投影层输出维度。
+            emb_skip_threshold (int, optional): 高基数特征跳过阈值。
+                当 vocab_size > emb_skip_threshold 且 emb_skip_threshold > 0 时，
+                该特征不创建 Embedding 表，forward 时输出零向量。默认为 0（不跳过）。
+        """
+        super().__init__()
+        self.feature_specs = feature_specs  # 特征元数据列表
+        self.groups = groups                # 特征分组方案
+        self.emb_dim = emb_dim              # 嵌入维度
+        self.emb_skip_threshold = emb_skip_threshold  # 高基数跳过阈值
+
+        # ---------------------------- Embedding 表构建 ----------------------------
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
+        # 为每个特征 fid 创建 Embedding 表，满足以下任一条件则跳过：
+        #   1. vocab_size <= 0（无有效词典信息）
+        #   2. emb_skip_threshold > 0 且 vocab_size > emb_skip_threshold（高基数特征）
         embs = []
         for vs, offset, length in feature_specs:
             skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
             if skip:
-                embs.append(None)
+                embs.append(None)  # 标记为跳过，不创建 Embedding 表
             else:
+                # +1 是为了容纳 padding_idx=0（零值作为填充标记，不参与梯度更新）
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+        # 过滤掉 None，仅保留实际创建的 Embedding 表
         self.embs = nn.ModuleList([e for e in embs if e is not None])
+
+        # ---------------------------- 特征索引映射 ----------------------------
         # Map from fid index to position in self.embs (or -1 if filtered)
+        # 建立原始 fid 索引到 self.embs 中实际位置的映射：
+        # - 若该特征未跳过，记录其在 self.embs 中的位置（real_idx）
+        # - 若该特征被跳过，标记为 -1，forward 时输出零向量
         self._emb_index = []
         real_idx = 0
         for e in embs:
@@ -1022,11 +1267,15 @@ class GroupNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
+        # ---------------------------- 组级投影层 ----------------------------
         # Per-group projection: num_fids_in_group * emb_dim -> d_model (with LayerNorm)
+        # 为每个特征组创建一个投影网络：
+        #   输入维度 = 组内特征数 × emb_dim（拼接后的嵌入向量）
+        #   输出维度 = d_model（通过 LayerNorm 稳定分布）
         self.group_projs = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(len(group) * emb_dim, d_model),
-                nn.LayerNorm(d_model),
+                nn.Linear(len(group) * emb_dim, d_model),  # 线性投影到模型维度
+                nn.LayerNorm(d_model),  # 层归一化，稳定各组 token 的数值分布
             )
             for group in groups
         ])
@@ -1084,34 +1333,64 @@ class RankMixerNSTokenizer(nn.Module):
         num_ns_tokens: int,
         emb_skip_threshold: int = 0,
     ) -> None:
-        """Initializes RankMixerNSTokenizer.
+        """初始化 RankMixerNSTokenizer 实例。
+
+        遵循 RankMixer 论文思路的 NS token 生成器。与 GroupNSTokenizer 的核心区别在于：
+        - GroupNSTokenizer：每组特征生成一个 NS token（token 数量 = 组数，不可调）。
+        - RankMixerNSTokenizer：所有特征嵌入拼接为长向量后，等分成 num_ns_tokens 段，
+          每段独立投影为一个 NS token（token 数量可自由设定，与组数解耦）。
+
+        工作流程：
+        1. 为每个特征 fid 创建 Embedding 表（高基数特征可选择跳过）。
+        2. 将所有组内特征的嵌入向量拼接为一个超长向量。
+        3. 将超长向量填充至可被 num_ns_tokens 整除，然后等分为 num_ns_tokens 段。
+        4. 每段通过独立的投影网络映射到 d_model 维度，生成对应 NS token。
 
         Args:
-            feature_specs: [(vocab_size, offset, length), ...] per feature.
-            groups: List of feature index groups (defines semantic ordering).
-            emb_dim: Embedding dimension per feature.
-            d_model: Output token dimension.
-            num_ns_tokens: Number of NS tokens to produce (T segments).
-            emb_skip_threshold: Skip embedding for features with vocab > threshold.
+            feature_specs (List[Tuple[int, int, int]]): 每个特征的三元组信息列表，
+                每个元组格式为 (vocab_size, offset, length)。
+                - vocab_size: 该特征的词典大小。
+                - offset: 该特征在 int_feats 张量中的起始列索引。
+                - length: 该特征的取值个数（1 表示单值，>1 表示多值）。
+            groups (List[List[int]]): 特征分组列表，定义特征拼接的顺序。
+                仅影响拼接顺序，不决定 NS token 数量。
+            emb_dim (int): 每个特征的嵌入维度。
+            d_model (int): 模型隐藏维度，即投影层输出维度。
+            num_ns_tokens (int): 目标 NS token 数量 T。
+                将所有特征嵌入等分为 T 段，每段生成一个 token。
+            emb_skip_threshold (int, optional): 高基数特征跳过阈值。
+                当 vocab_size > emb_skip_threshold 且 emb_skip_threshold > 0 时，
+                该特征不创建 Embedding 表，forward 时输出零向量。默认为 0（不跳过）。
         """
         super().__init__()
-        self.feature_specs = feature_specs
-        self.groups = groups
-        self.emb_dim = emb_dim
-        self.num_ns_tokens = num_ns_tokens
-        self.emb_skip_threshold = emb_skip_threshold
+        self.feature_specs = feature_specs  # 特征元数据列表
+        self.groups = groups                # 特征分组方案（决定拼接顺序）
+        self.emb_dim = emb_dim              # 嵌入维度
+        self.num_ns_tokens = num_ns_tokens  # 目标 NS token 数量 T
+        self.emb_skip_threshold = emb_skip_threshold  # 高基数跳过阈值
 
+        # ---------------------------- Embedding 表构建 ----------------------------
         # One embedding table per fid (None if skipped by emb_skip_threshold
         # or if vocab_size <= 0 / no vocab info).
+        # 为每个特征 fid 创建 Embedding 表，满足以下任一条件则跳过：
+        #   1. vocab_size <= 0（无有效词典信息）
+        #   2. emb_skip_threshold > 0 且 vocab_size > emb_skip_threshold（高基数特征）
         embs = []
         for vs, offset, length in feature_specs:
             skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
             if skip:
-                embs.append(None)
+                embs.append(None)  # 标记为跳过，不创建 Embedding 表
             else:
+                # +1 是为了容纳 padding_idx=0（零值作为填充标记，不参与梯度更新）
                 embs.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
+        # 过滤掉 None，仅保留实际创建的 Embedding 表
         self.embs = nn.ModuleList([e for e in embs if e is not None])
+
+        # ---------------------------- 特征索引映射 ----------------------------
         # Map from fid index to position in self.embs (or -1 if filtered)
+        # 建立原始 fid 索引到 self.embs 中实际位置的映射：
+        # - 若该特征未跳过，记录其在 self.embs 中的位置（real_idx）
+        # - 若该特征被跳过，标记为 -1，forward 时输出零向量
         self._emb_index = []
         real_idx = 0
         for e in embs:
@@ -1121,24 +1400,39 @@ class RankMixerNSTokenizer(nn.Module):
             else:
                 self._emb_index.append(-1)
 
+        # ---------------------------- 分块维度计算 ----------------------------
         # Compute total embedding dim: sum of all fids across all groups
+        # 计算所有特征嵌入拼接后的总维度：
+        #   总特征数 = 所有组的特征数之和
+        #   总嵌入维度 = 总特征数 × 每个特征的嵌入维度 emb_dim
         total_num_fids = sum(len(g) for g in groups)
         total_emb_dim = total_num_fids * emb_dim
 
         # Pad total_emb_dim to be divisible by num_ns_tokens
+        # 将总嵌入维度填充至可被 num_ns_tokens 整除：
+        #   chunk_dim = ceil(total_emb_dim / num_ns_tokens)  每段的目标维度
+        #   padded_total_dim = chunk_dim * num_ns_tokens      填充后的总维度
+        #   _pad_size = 填充的零值维度数
         self.chunk_dim = math.ceil(total_emb_dim / num_ns_tokens)
         self.padded_total_dim = self.chunk_dim * num_ns_tokens
         self._pad_size = self.padded_total_dim - total_emb_dim
 
+        # ---------------------------- 分段投影层 ----------------------------
         # Per-chunk projection: chunk_dim -> d_model with LayerNorm
+        # 为每个 NS token 段创建一个独立的投影网络：
+        #   输入维度 = chunk_dim（每段填充后的维度）
+        #   输出维度 = d_model（通过 LayerNorm 稳定分布）
+        # 共 num_ns_tokens 个投影器，彼此不共享参数
         self.token_projs = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(self.chunk_dim, d_model),
-                nn.LayerNorm(d_model),
+                nn.Linear(self.chunk_dim, d_model),  # 线性投影到模型维度
+                nn.LayerNorm(d_model),  # 层归一化，稳定各 token 的数值分布
             )
             for _ in range(num_ns_tokens)
         ])
 
+        # ---------------------------- 初始化日志 ----------------------------
+        # 打印 tokenizer 的关键维度信息，便于调试和验证配置
         logging.info(
             f"RankMixerNSTokenizer: {total_num_fids} fids, "
             f"total_emb_dim={total_emb_dim}, chunk_dim={self.chunk_dim}, "
@@ -1232,23 +1526,29 @@ class PCVRHyFormer(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.d_model = d_model
-        self.emb_dim = emb_dim
-        self.action_num = action_num
-        self.num_queries = num_queries
-        self.seq_domains = sorted(seq_vocab_sizes.keys())  # deterministic order
-        self.num_sequences = len(self.seq_domains)
-        self.num_time_buckets = num_time_buckets
-        self.rank_mixer_mode = rank_mixer_mode
-        self.use_rope = use_rope
-        self.emb_skip_threshold = emb_skip_threshold
-        self.seq_id_threshold = seq_id_threshold
-        self.ns_tokenizer_type = ns_tokenizer_type
+        # ================== 核心超参数与元数据保存 ==================
+        self.d_model = d_model              # 模型隐藏维度，所有 token 的统一表示维度
+        self.emb_dim = emb_dim              # Embedding 层输出维度，序列特征先嵌入到 emb_dim 再投影到 d_model
+        self.action_num = action_num        # 分类任务输出维度，默认 1（二分类 logits）
+        self.num_queries = num_queries      # 每序列查询 token 数量，控制信息压缩程度
+        self.seq_domains = sorted(seq_vocab_sizes.keys())  # 序列域名称列表，排序保证确定性顺序
+        self.num_sequences = len(self.seq_domains)         # 序列域总数量（如点击序列、加购序列等）
+        self.num_time_buckets = num_time_buckets             # 时间间隔分桶数，0 表示不启用时间嵌入
+        self.rank_mixer_mode = rank_mixer_mode               # RankMixer 模式：'full' 或 'separate'
+        self.use_rope = use_rope                             # 是否启用旋转位置编码（RoPE）
+        self.emb_skip_threshold = emb_skip_threshold         # 词表大小超过此阈值时跳过 Embedding 创建，节省内存
+        self.seq_id_threshold = seq_id_threshold             # 判断序列特征是否为 ID 类特征的阈值，ID 特征应用更强 Dropout
+        self.ns_tokenizer_type = ns_tokenizer_type           # NS tokenizer 变体：'group' 或 'rankmixer'
 
-        # ================== NS Tokens Construction ==================
-
+        # ================== NS Tokens 构建（非序列特征压缩） ==================
+        # NS（Non-Sequence）Tokenizer 的作用：将用户/物品的静态离散特征（如用户画像、商品类目）
+        # 按预定义分组聚合成少量压缩 token，作为模型输入的一部分。
+        # 支持两种变体：
+        #   - 'group'：每组生成 1 个 NS token，结构简单。
+        #   - 'rankmixer'（默认）：参考 RankMixer 论文，先将所有特征 Embedding 拼接，
+        #     再分割投影为固定数量的 NS token，表达能力更强。
         if ns_tokenizer_type == 'group':
-            # Original: one NS token per group
+            # 原始方案：每个特征组对应 1 个 NS token
             self.user_ns_tokenizer = GroupNSTokenizer(
                 feature_specs=user_int_feature_specs,
                 groups=user_ns_groups,
@@ -1267,8 +1567,8 @@ class PCVRHyFormer(nn.Module):
             )
             num_item_ns = len(item_ns_groups)
         elif ns_tokenizer_type == 'rankmixer':
-            # RankMixer paper style: all embeddings cat → split → project
-            # 0 means auto: fall back to group count
+            # RankMixer 风格：所有 Embedding 拼接 → 分割 → 投影为 num_ns_tokens 个 token
+            # user_ns_tokens / item_ns_tokens 为 0 时自动回退到组数，保证兼容性
             if user_ns_tokens <= 0:
                 user_ns_tokens = len(user_ns_groups)
             if item_ns_tokens <= 0:
@@ -1295,7 +1595,9 @@ class PCVRHyFormer(nn.Module):
         else:
             raise ValueError(f"Unknown ns_tokenizer_type: {ns_tokenizer_type}")
 
-        # User dense feature projection (if available)
+        # ================== 稠密特征投影层 ==================
+        # 若输入中包含连续型（dense）特征，通过 Linear + LayerNorm 投影到 d_model 维度，
+        # 使其与 NS token 和序列 token 处于同一语义空间。
         self.has_user_dense = user_dense_dim > 0
         if self.has_user_dense:
             self.user_dense_proj = nn.Sequential(
@@ -1303,7 +1605,6 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
@@ -1311,11 +1612,16 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        # Total NS token count
+        # ================== NS Token 总数统计 ==================
+        # 总 NS token 数 = 用户侧 NS token + 用户稠密 token（如有）
+        #                  + 物品侧 NS token + 物品稠密 token（如有）
         self.num_ns = (num_user_ns + (1 if self.has_user_dense else 0)
                        + num_item_ns + (1 if self.has_item_dense else 0))
 
-        # ================== Check d_model % T == 0 constraint (full mode only) ==================
+        # ================== d_model 整除约束检查（仅 full 模式） ==================
+        # full 模式下，RankMixer 需要将 d_model 均分为 T 份，每份对应一个 token 的专属子空间。
+        # T = 每序列查询数 × 序列数 + NS token 总数。
+        # 若不能整除，计算并提示所有合法的 T 值供调参参考。
         T = num_queries * self.num_sequences + self.num_ns
         if rank_mixer_mode == 'full' and d_model % T != 0:
             valid_T_values = [t for t in range(1, d_model + 1) if d_model % t == 0]
@@ -1325,15 +1631,26 @@ class PCVRHyFormer(nn.Module):
                 f"Valid T values for d_model={d_model}: {valid_T_values}"
             )
 
-        # ================== Seq Tokens Embedding ==================
-        # seq_id_threshold decides which features inside the seq tokenizer are
-        # treated as id features (they receive extra dropout). It is fully
-        # independent of emb_skip_threshold (which skips Embedding creation).
+        # ================== 序列特征 Embedding 构建 ==================
+        # seq_id_threshold 用于判断序列内的哪些特征属于“ID 类特征”（如 item_id、shop_id），
+        # 这类特征词表通常极大，需施加更强的 Dropout（dropout_rate * 2）防止过拟合。
+        # 注意：seq_id_threshold 与 emb_skip_threshold 完全独立：
+        #   - emb_skip_threshold：决定是否创建 Embedding 层（内存优化）
+        #   - seq_id_threshold：决定是否对特征施加额外 Dropout（正则化优化）
         self.seq_id_emb_dropout = nn.Dropout(dropout_rate * 2)
 
         def _make_seq_embs(vocab_sizes):
-            """Create embedding list, returning None for features skipped via
-            emb_skip_threshold or with no vocab info (vs<=0)."""
+            """为单个序列域构建 Embedding 层列表。
+
+            规则：
+            1. 若词表大小 vs <= 0，或启用 emb_skip_threshold 且 vs > threshold，则跳过该特征（返回 None）。
+            2. 否则创建 nn.Embedding(vs+1, emb_dim, padding_idx=0)，+1 为 padding 预留索引 0。
+
+            返回：
+                - module_list：实际创建的 Embedding 层（nn.ModuleList）
+                - index_map：原始特征位置 → module_list 真实索引的映射，-1 表示被跳过
+                - is_id：标记每个特征是否为 ID 类特征（vs > seq_id_threshold）
+            """
             embs_raw = []
             for vs in vocab_sizes:
                 skip = int(vs) <= 0 or (emb_skip_threshold > 0 and int(vs) > emb_skip_threshold)
@@ -1342,7 +1659,7 @@ class PCVRHyFormer(nn.Module):
                 else:
                     embs_raw.append(nn.Embedding(int(vs) + 1, emb_dim, padding_idx=0))
             module_list = nn.ModuleList([e for e in embs_raw if e is not None])
-            # Map from position index to real index in module_list (-1 if skipped)
+            # 建立原始特征索引到 module_list 实际索引的映射，-1 表示该特征被跳过
             index_map = []
             real_idx = 0
             for e in embs_raw:
@@ -1354,7 +1671,13 @@ class PCVRHyFormer(nn.Module):
             is_id = [int(vs) > seq_id_threshold for vs in vocab_sizes]
             return module_list, index_map, is_id
 
-        # ================== Dynamic Sequence Embeddings ==================
+        # ================== 动态序列 Embedding 注册 ==================
+        # 每个序列域（domain）独立维护一套 Embedding 和投影层，支持异构序列长度与特征维度。
+        # _seq_embs[domain]：该域实际创建的 Embedding 层列表
+        # _seq_emb_index[domain]：特征位置到 Embedding 层索引的映射（处理跳过特征）
+        # _seq_is_id[domain]：标记各特征是否为 ID 类特征，用于前向时施加不同 Dropout
+        # _seq_vocab_sizes[domain]：保存原始词表大小，供跳过统计和后续查找使用
+        # _seq_proj[domain]：将拼接后的多特征 Embedding（len(vs)*emb_dim）投影到 d_model
         self._seq_embs = nn.ModuleDict()
         self._seq_emb_index = {}    # domain -> index_map
         self._seq_is_id = {}        # domain -> is_id list
@@ -1373,12 +1696,14 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        # ================== Time Interval Bucket Embedding (optional) ==================
+        # ================== 时间间隔分桶 Embedding（可选） ==================
+        # 若 num_time_buckets > 0，为序列中相邻行为的时间间隔创建可学习嵌入。
+        # 例如：65 个桶可覆盖从秒级到月级的行为间隔，增强模型对时间序列模式的感知。
         if num_time_buckets > 0:
             self.time_embedding = nn.Embedding(num_time_buckets, d_model, padding_idx=0)
 
-        # ================== HyFormer Components ==================
-        # MultiSeqQueryGenerator
+        # ================== HyFormer 核心组件 ==================
+        # QueryGenerator：基于 NS token 生成各序列的初始查询向量（learnable queries 与 NS 信息融合）
         self.query_generator = MultiSeqQueryGenerator(
             d_model=d_model,
             num_ns=self.num_ns,
@@ -1387,7 +1712,8 @@ class PCVRHyFormer(nn.Module):
             hidden_mult=hidden_mult,
         )
 
-        # MultiSeqHyFormerBlock stack
+        # HyFormer Block 堆叠：每块内部包含序列内自注意力 + 序列间交叉注意力 + FFN，
+        # 重复 num_hyformer_blocks 次以逐步提炼多序列交互表征。
         self.blocks = nn.ModuleList([
             MultiSeqHyFormerBlock(
                 d_model=d_model,
@@ -1405,23 +1731,29 @@ class PCVRHyFormer(nn.Module):
             for _ in range(num_hyformer_blocks)
         ])
 
-        # ================== RoPE ==================
+        # ================== 旋转位置编码（RoPE，可选） ==================
+        # RoPE 通过旋转矩阵为注意力注入相对位置信息，替代绝对位置编码。
+        # 若启用，为每个注意力头计算对应维度的旋转编码，base 控制波长。
         if use_rope:
             head_dim = d_model // num_heads
             self.rotary_emb = RotaryEmbedding(dim=head_dim, base=rope_base)
         else:
             self.rotary_emb = None
 
-        # Output projection
+        # ================== 输出投影层 ==================
+        # 将各序列、各 query 的 d_model 维度表征拼接后，投影回 d_model，
+        # 实现多源信息的深度融合与维度统一，供后续分类器使用。
         self.output_proj = nn.Sequential(
             nn.Linear(num_queries * self.num_sequences * d_model, d_model),
             nn.LayerNorm(d_model),
         )
 
-        # Dropout
+        # ================== Dropout 与分类器 ==================
+        # emb_dropout：对最终输入模型的 token 表征施加正则化
         self.emb_dropout = nn.Dropout(dropout_rate)
 
-        # Classifier
+        # clsfier：两层 MLP 分类头，含 SiLU 激活、LayerNorm 和 Dropout，
+        # 输出维度为 action_num（默认 1，对应二分类 logit）。
         self.clsfier = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.LayerNorm(d_model),
@@ -1430,10 +1762,13 @@ class PCVRHyFormer(nn.Module):
             nn.Linear(d_model, action_num)
         )
 
-        # Initialize parameters
+        # ================== 参数初始化 ==================
+        # 统一初始化模型中所有 Linear 和 Embedding 层的权重，保证训练初期数值稳定性。
         self._init_params()
 
-        # Log emb_skip_threshold filtering stats
+        # ================== emb_skip_threshold 过滤统计日志 ==================
+        # 若启用了大词表跳过（emb_skip_threshold > 0），打印各序列域和 NS tokenizer 中
+        # 被跳过特征的比例，方便确认内存优化效果及是否有重要特征被误跳过。
         if emb_skip_threshold > 0:
             def _count_filtered(vocab_sizes, emb_index):
                 filtered = sum(1 for idx in emb_index if idx == -1)

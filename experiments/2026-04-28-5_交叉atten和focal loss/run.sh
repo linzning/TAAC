@@ -12,8 +12,9 @@ python3 -u "${SCRIPT_DIR}/train.py" \
     --emb_skip_threshold 1000000 \
     --use_inter_seq_attn \
     --num_workers 8 \
-    --train_ratio 0.2 \
-    --num_epochs 1 \
+    --loss_type focal \
+    --focal_alpha 0.25 \
+    --focal_gamma 2.0 \
     "$@"
 
 # ---- Alternative config: GroupNSTokenizer driven by ns_groups.json ----

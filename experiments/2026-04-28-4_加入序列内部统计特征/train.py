@@ -156,6 +156,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--use_inter_seq_attn', action='store_true', default=False,
                         help='Enable inter-sequence cross-attention in MultiSeqHyFormerBlock: '
                              'each sequence\'s Q tokens attend to all other sequences\' encoded tokens')
+    parser.add_argument('--use_seq_stats', action='store_true', default=True,
+                        help='Enable sequence internal statistics features '
+                             '(unique_ratio, repeat_count, top_freq, cross-domain aggregates)')
+    parser.add_argument('--no_seq_stats', dest='use_seq_stats', action='store_false',
+                        help='Disable sequence internal statistics features')
 
     # Loss function.
     parser.add_argument('--loss_type', type=str, default='bce', choices=['bce', 'focal'],
@@ -344,6 +349,7 @@ def main() -> None:
         "user_ns_tokens": args.user_ns_tokens,
         "item_ns_tokens": args.item_ns_tokens,
         "use_inter_seq_attn": args.use_inter_seq_attn,
+        "use_seq_stats": args.use_seq_stats,
     }
 
     # 实例化模型并迁移到目标设备（cuda / cpu）
