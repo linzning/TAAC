@@ -1605,7 +1605,6 @@ class PCVRHyFormer(nn.Module):
                 nn.LayerNorm(d_model),
             )
 
-        # Item dense feature projection (if available)
         self.has_item_dense = item_dense_dim > 0
         if self.has_item_dense:
             self.item_dense_proj = nn.Sequential(
